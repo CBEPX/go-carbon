@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/lomik/go-whisper"
+	"github.com/go-graphite/go-whisper"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,7 +57,7 @@ func TestParseRetentionDefs(t *testing.T) {
 	assert.Error(err)
 }
 
-func parseSchemas(t *testing.T, content string) (*WhisperSchemas, error) {
+func parseSchemas(t *testing.T, content string) (WhisperSchemas, error) {
 	tmpFile, err := ioutil.TempFile("", "schemas-")
 	if err != nil {
 		t.Fatal(err)
@@ -81,17 +81,17 @@ type testcase struct {
 	retentions string
 }
 
-func assertSchemas(t *testing.T, content string, expected []testcase, msg ...interface{}) *WhisperSchemas {
+func assertSchemas(t *testing.T, content string, expected []testcase, msg ...interface{}) WhisperSchemas {
 	schemas, err := parseSchemas(t, content)
 	if expected == nil {
 		assert.Error(t, err, msg...)
 		return nil
 	}
-	assert.Equal(t, len(expected), len(schemas.Data))
+	assert.Equal(t, len(expected), len(schemas))
 	for i := 0; i < len(expected); i++ {
-		assert.Equal(t, expected[i].name, schemas.Data[i].name)
-		assert.Equal(t, expected[i].pattern, schemas.Data[i].pattern.String())
-		assertRetentionsEq(t, schemas.Data[i].retentions, expected[i].retentions)
+		assert.Equal(t, expected[i].name, schemas[i].Name)
+		assert.Equal(t, expected[i].pattern, schemas[i].Pattern.String())
+		assertRetentionsEq(t, schemas[i].Retentions, expected[i].retentions)
 	}
 
 	return schemas
@@ -110,6 +110,19 @@ retentions = 1m:30d,1h:5y
 		[]testcase{
 			testcase{"carbon", "^carbon\\.", "60s:90d"},
 			testcase{"default", ".*", "1m:30d,1h:5y"},
+		},
+	)
+}
+
+func TestParseSchemasComment(t *testing.T) {
+	assertSchemas(t, `
+# This is a wild comment
+[carbon]
+pattern = ^carbon\.
+retentions = 60s:90d
+	`,
+		[]testcase{
+			testcase{"carbon", "^carbon\\.", "60s:90d"},
 		},
 	)
 }
@@ -151,18 +164,18 @@ priority = 10
 		},
 	)
 
-	matched := schemas.match("db.collector.cpu")
-	if assert.NotNil(matched) {
-		assert.Equal("collector", matched.name)
+	matched, ok := schemas.Match("db.collector.cpu")
+	if assert.True(ok) {
+		assert.Equal("collector", matched.Name)
 	}
 
-	matched = schemas.match("db.mysql.rps")
-	if assert.NotNil(matched) {
-		assert.Equal("db", matched.name)
+	matched, ok = schemas.Match("db.mysql.rps")
+	if assert.True(ok) {
+		assert.Equal("db", matched.Name)
 	}
 
-	matched = schemas.match("unknown")
-	assert.Nil(matched)
+	matched, ok = schemas.Match("unknown")
+	assert.False(ok)
 }
 
 func TestSchemasNotFound(t *testing.T) {

@@ -2,81 +2,81 @@ package persister
 
 import (
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
-	"time"
+	"syscall"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/benbjohnson/clock"
-	"github.com/lomik/go-whisper"
+	whisper "github.com/go-graphite/go-whisper"
+	"go.uber.org/zap"
 
+	"github.com/lomik/go-carbon/helper"
 	"github.com/lomik/go-carbon/points"
+	"github.com/lomik/go-carbon/tags"
+	"github.com/lomik/zapwriter"
 )
 
-// CreateOpener whisper opener interface for mock in tests
-type CreateOpener interface {
-	Create(string, whisper.Retentions, whisper.AggregationMethod, float32) (*whisper.Whisper, error)
-	Open(string) (*whisper.Whisper, error)
-}
+const storeMutexCount = 32768
 
-// Persister is a struct to hold dependencies via interface
-type Persister struct {
-	Clock   clock.Clock
-	Whisper CreateOpener
-}
-
-var app = Persister{
-	Clock:   clock.New(),
-	Whisper: WhisperFactory{},
-}
+type StoreFunc func(metric string)
 
 // Whisper write data to *.wsp files
 type Whisper struct {
-	updateOperations    uint32
-	commitedPoints      uint32
-	in                  chan *points.Points
-	exit                chan bool
-	schemas             *WhisperSchemas
-	aggregation         *WhisperAggregation
-	workersCount        int
-	rootPath            string
-	graphPrefix         string
-	created             uint32 // counter
-	maxUpdatesPerSecond int
+	helper.Stoppable
+	recv                    func(chan bool) string
+	pop                     func(string) (*points.Points, bool)
+	confirm                 func(*points.Points)
+	tagsEnabled             bool
+	taggedFn                func(string, bool)
+	schemas                 WhisperSchemas
+	aggregation             *WhisperAggregation
+	workersCount            int
+	rootPath                string
+	created                 uint32 // counter
+	throttledCreates        uint32 // counter
+	updateOperations        uint32 // counter
+	committedPoints         uint32 // counter
+	sparse                  bool
+	flock                   bool
+	hashFilenames           bool
+	maxUpdatesPerSecond     int
+	maxCreatesPerSecond     int
+	hardMaxCreatesPerSecond bool
+	throttleTicker          *ThrottleTicker
+	maxCreatesTicker        *ThrottleTicker
+	storeMutex              [storeMutexCount]sync.Mutex
+	mockStore               func() (StoreFunc, func())
+	logger                  *zap.Logger
+	createLogger            *zap.Logger
+	// blockThrottleNs        uint64 // sum ns counter
+	// blockQueueGetNs        uint64 // sum ns counter
+	// blockAvoidConcurrentNs uint64 // sum ns counter
+	// blockUpdateManyNs      uint64 // sum ns counter
 }
 
 // NewWhisper create instance of Whisper
-func NewWhisper(rootPath string, schemas *WhisperSchemas, aggregation *WhisperAggregation, in chan *points.Points) *Whisper {
+func NewWhisper(
+	rootPath string,
+	schemas WhisperSchemas,
+	aggregation *WhisperAggregation,
+	recv func(chan bool) string,
+	pop func(string) (*points.Points, bool),
+	confirm func(*points.Points)) *Whisper {
+
 	return &Whisper{
-		in:                  in,
-		exit:                make(chan bool),
+		recv:                recv,
+		pop:                 pop,
+		confirm:             confirm,
 		schemas:             schemas,
 		aggregation:         aggregation,
 		workersCount:        1,
 		rootPath:            rootPath,
 		maxUpdatesPerSecond: 0,
+		logger:              zapwriter.Logger("persister"),
+		createLogger:        zapwriter.Logger("whisper:new"),
 	}
-}
-
-// WhisperFactory - holder for factory functions
-type WhisperFactory struct{}
-
-// Create creates a new underlying whisperdb file
-func (WhisperFactory) Create(path string, retentions whisper.Retentions, aggregationMethod whisper.AggregationMethod, xFilesFactor float32) (*whisper.Whisper, error) {
-	return whisper.Create(path, retentions, aggregationMethod, xFilesFactor)
-}
-
-// Open opens an existing underlying whisperdb file
-func (WhisperFactory) Open(path string) (*whisper.Whisper, error) {
-	return whisper.Open(path)
-}
-
-// SetGraphPrefix for internal cache metrics
-func (p *Whisper) SetGraphPrefix(prefix string) {
-	p.graphPrefix = prefix
 }
 
 // SetMaxUpdatesPerSecond enable throttling
@@ -84,57 +84,184 @@ func (p *Whisper) SetMaxUpdatesPerSecond(maxUpdatesPerSecond int) {
 	p.maxUpdatesPerSecond = maxUpdatesPerSecond
 }
 
+// SetMaxCreatesPerSecond enable throttling
+func (p *Whisper) SetMaxCreatesPerSecond(maxCreatesPerSecond int) {
+	p.maxCreatesPerSecond = maxCreatesPerSecond
+}
+
+// SetHardMaxCreatesPerSecond enable throttling
+func (p *Whisper) SetHardMaxCreatesPerSecond(hardMaxCreatesPerSecond bool) {
+	p.hardMaxCreatesPerSecond = hardMaxCreatesPerSecond
+}
+
+// GetMaxUpdatesPerSecond returns current throttling speed
+func (p *Whisper) GetMaxUpdatesPerSecond() int {
+	return p.maxUpdatesPerSecond
+}
+
 // SetWorkers count
 func (p *Whisper) SetWorkers(count int) {
-	p.workersCount = count
+	if count >= 1 {
+		p.workersCount = count
+	} else {
+		p.workersCount = 1
+	}
 }
 
-// Stat sends internal statistics to cache
-func (p *Whisper) Stat(metric string, value float64) {
-	p.in <- points.OnePoint(
-		fmt.Sprintf("%spersister.%s", p.graphPrefix, metric),
-		value,
-		app.Clock.Now().Unix(),
-	)
+// SetSparse creation
+func (p *Whisper) SetSparse(sparse bool) {
+	p.sparse = sparse
 }
 
-func (p *Whisper) store(values *points.Points) {
-	path := filepath.Join(p.rootPath, strings.Replace(values.Metric, ".", "/", -1)+".wsp")
+// SetFLock on create and open
+func (p *Whisper) SetFLock(flock bool) {
+	p.flock = flock
+}
 
-	w, err := app.Whisper.Open(path)
+func (p *Whisper) SetHashFilenames(v bool) {
+	p.hashFilenames = v
+}
+
+func (p *Whisper) SetMockStore(fn func() (StoreFunc, func())) {
+	p.mockStore = fn
+}
+
+func (p *Whisper) SetTagsEnabled(v bool) {
+	p.tagsEnabled = v
+}
+
+func (p *Whisper) SetTaggedFn(fn func(string, bool)) {
+	p.taggedFn = fn
+}
+
+func fnv32(key string) uint32 {
+	hash := uint32(2166136261)
+	const prime32 = uint32(16777619)
+	for i := 0; i < len(key); i++ {
+		hash *= prime32
+		hash ^= uint32(key[i])
+	}
+	return hash
+}
+
+func (p *Whisper) updateMany(w *whisper.Whisper, path string, points []*whisper.TimeSeriesPoint) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("UpdateMany panic recovered",
+				zap.String("path", path),
+				zap.String("traceback", fmt.Sprint(r)),
+			)
+		}
+	}()
+
+	// start = time.Now()
+	w.UpdateMany(points)
+}
+
+func (p *Whisper) store(metric string) {
+	// avoid concurrent store same metric
+	// @TODO: may be flock?
+	// start := time.Now()
+	mutexIndex := fnv32(metric) % storeMutexCount
+	p.storeMutex[mutexIndex].Lock()
+	// atomic.AddUint64(&p.blockAvoidConcurrentNs, uint64(time.Since(start).Nanoseconds()))
+	defer p.storeMutex[mutexIndex].Unlock()
+
+	var path string
+	if p.tagsEnabled && strings.IndexByte(metric, ';') >= 0 {
+		path = tags.FilePath(p.rootPath, metric, p.hashFilenames) + ".wsp"
+	} else {
+		path = filepath.Join(p.rootPath, strings.Replace(metric, ".", "/", -1)+".wsp")
+	}
+
+	w, err := whisper.OpenWithOptions(path, &whisper.Options{
+		FLock: p.flock,
+	})
 	if err != nil {
-		schema := p.schemas.match(values.Metric)
-		if schema == nil {
-			logrus.Errorf("[persister] No storage schema defined for %s", values.Metric)
+		// create new whisper if file not exists
+		if !os.IsNotExist(err) {
+			p.logger.Error("failed to open whisper file", zap.String("path", path), zap.Error(err))
+			if pathErr, isPathErr := err.(*os.PathError); isPathErr && pathErr.Err == syscall.ENAMETOOLONG {
+				p.pop(metric)
+			}
 			return
 		}
 
-		aggr := p.aggregation.match(values.Metric)
+		if t := p.maxCreatesThrottling(); t != throttlingOff {
+			if t == throttlingHard {
+				p.pop(metric)
+			}
+
+			atomic.AddUint32(&p.throttledCreates, 1)
+			p.logger.Error("metric creation throttled",
+				zap.String("name", metric),
+				zap.String("operation", "create"),
+				zap.Bool("dropped", t == throttlingHard),
+			)
+
+			return
+		}
+
+		schema, ok := p.schemas.Match(metric)
+		if !ok {
+			p.logger.Error("no storage schema defined for metric", zap.String("metric", metric))
+			return
+		}
+
+		aggr := p.aggregation.match(metric)
 		if aggr == nil {
-			logrus.Errorf("[persister] No storage aggregation defined for %s", values.Metric)
+			p.logger.Error("no storage aggregation defined for metric", zap.String("metric", metric))
 			return
 		}
-
-		logrus.WithFields(logrus.Fields{
-			"retention":    schema.retentionStr,
-			"schema":       schema.name,
-			"aggregation":  aggr.name,
-			"xFilesFactor": aggr.xFilesFactor,
-			"method":       aggr.aggregationMethodStr,
-		}).Debugf("[persister] Creating %s", path)
 
 		if err = os.MkdirAll(filepath.Dir(path), os.ModeDir|os.ModePerm); err != nil {
-			logrus.Error(err)
+			p.logger.Error("mkdir failed",
+				zap.String("dir", filepath.Dir(path)),
+				zap.Error(err),
+				zap.String("path", path),
+			)
 			return
 		}
 
-		w, err = app.Whisper.Create(path, schema.retentions, aggr.aggregationMethod, float32(aggr.xFilesFactor))
+		w, err = whisper.CreateWithOptions(path, schema.Retentions, aggr.aggregationMethod, float32(aggr.xFilesFactor), &whisper.Options{
+			Sparse: p.sparse,
+			FLock:  p.flock,
+		})
 		if err != nil {
-			logrus.Errorf("[persister] Failed to create new whisper file %s: %s", path, err.Error())
+			p.logger.Error("create new whisper file failed",
+				zap.String("path", path),
+				zap.Error(err),
+				zap.String("retention", schema.RetentionStr),
+				zap.String("schema", schema.Name),
+				zap.String("aggregation", aggr.name),
+				zap.Float64("xFilesFactor", aggr.xFilesFactor),
+				zap.String("method", aggr.aggregationMethodStr),
+			)
 			return
 		}
+
+		if p.tagsEnabled && p.taggedFn != nil && strings.IndexByte(metric, ';') >= 0 {
+			p.taggedFn(metric, true)
+		}
+
+		p.createLogger.Debug("created",
+			zap.String("path", path),
+			zap.String("retention", schema.RetentionStr),
+			zap.String("schema", schema.Name),
+			zap.String("aggregation", aggr.name),
+			zap.Float64("xFilesFactor", aggr.xFilesFactor),
+			zap.String("method", aggr.aggregationMethodStr),
+		)
 
 		atomic.AddUint32(&p.created, 1)
+	}
+
+	values, exists := p.pop(metric)
+	if !exists {
+		return
+	}
+	if p.confirm != nil {
+		defer p.confirm(values)
 	}
 
 	points := make([]*whisper.TimeSeriesPoint, len(values.Data))
@@ -142,111 +269,152 @@ func (p *Whisper) store(values *points.Points) {
 		points[i] = &whisper.TimeSeriesPoint{Time: int(r.Timestamp), Value: r.Value}
 	}
 
-	atomic.AddUint32(&p.commitedPoints, uint32(len(values.Data)))
+	atomic.AddUint32(&p.committedPoints, uint32(len(values.Data)))
 	atomic.AddUint32(&p.updateOperations, 1)
 
-	defer w.Close()
+	// start = time.Now()
+	p.updateMany(w, path, points)
+	w.Close()
+	// atomic.AddUint64(&p.blockUpdateManyNs, uint64(time.Since(start).Nanoseconds()))
 
-	defer func() {
-		if r := recover(); r != nil {
-			logrus.Errorf("[persister] UpdateMany %s recovered: %s", path, r)
-		}
-	}()
-	w.UpdateMany(points)
+	if p.tagsEnabled && p.taggedFn != nil && strings.IndexByte(metric, ';') >= 0 {
+		p.taggedFn(metric, false)
+	}
 }
 
-func (p *Whisper) worker(in chan *points.Points) {
-	for {
+type throttleMode int
+
+const (
+	throttlingOff  throttleMode = iota
+	throttlingSoft throttleMode = iota
+	throttlingHard throttleMode = iota
+)
+
+// For test error messages
+func (t throttleMode) String() string {
+	if t == throttlingHard {
+		return "hard"
+	}
+
+	if t == throttlingSoft {
+		return "soft"
+	}
+
+	return "off"
+}
+
+func (p *Whisper) maxCreatesThrottling() throttleMode {
+	if p.hardMaxCreatesPerSecond {
+		keep, open := <-p.maxCreatesTicker.C
+		if !open {
+			return throttlingHard
+		}
+
+		if keep {
+			return throttlingOff
+		}
+
+		return throttlingHard
+	} else {
 		select {
-		case <-p.exit:
-			break
-		case values := <-in:
-			p.store(values)
+		case <-p.maxCreatesTicker.C:
+			return throttlingOff
+
+		default:
+			return throttlingSoft
 		}
 	}
 }
 
-func (p *Whisper) shuffler(in chan *points.Points, out [](chan *points.Points)) {
-	workers := uint32(len(out))
+func (p *Whisper) worker(exit chan bool) {
+	storeFunc := p.store
+	var doneCb func()
+	if p.mockStore != nil {
+		storeFunc, doneCb = p.mockStore()
+	}
+
+LOOP:
 	for {
+		// start := time.Now()
 		select {
-		case <-p.exit:
-			break
-		case values := <-in:
-			index := crc32.ChecksumIEEE([]byte(values.Metric)) % workers
-			out[index] <- values
+		case <-p.throttleTicker.C:
+			// atomic.AddUint64(&p.blockThrottleNs, uint64(time.Since(start).Nanoseconds()))
+			// pass
+		case <-exit:
+			return
+		}
+
+		// start = time.Now()
+		metric := p.recv(exit)
+		// atomic.AddUint64(&p.blockQueueGetNs, uint64(time.Since(start).Nanoseconds()))
+		if metric == "" {
+			// exit closed
+			break LOOP
+		}
+		storeFunc(metric)
+		if doneCb != nil {
+			doneCb()
 		}
 	}
 }
 
-// save stat
-func (p *Whisper) doCheckpoint() {
+// Stat callback
+func (p *Whisper) Stat(send helper.StatCallback) {
 	updateOperations := atomic.LoadUint32(&p.updateOperations)
-	commitedPoints := atomic.LoadUint32(&p.commitedPoints)
+	committedPoints := atomic.LoadUint32(&p.committedPoints)
 	atomic.AddUint32(&p.updateOperations, -updateOperations)
-	atomic.AddUint32(&p.commitedPoints, -commitedPoints)
+	atomic.AddUint32(&p.committedPoints, -committedPoints)
 
 	created := atomic.LoadUint32(&p.created)
 	atomic.AddUint32(&p.created, -created)
 
-	logrus.WithFields(logrus.Fields{
-		"updateOperations": float64(updateOperations),
-		"commitedPoints":   float64(commitedPoints),
-		"created":          created,
-	}).Info("[persister] doCheckpoint()")
+	throttledCreates := atomic.LoadUint32(&p.throttledCreates)
+	atomic.AddUint32(&p.throttledCreates, -throttledCreates)
 
-	p.Stat("updateOperations", float64(updateOperations))
-	p.Stat("commitedPoints", float64(commitedPoints))
+	send("updateOperations", float64(updateOperations))
+	send("committedPoints", float64(committedPoints))
 	if updateOperations > 0 {
-		p.Stat("pointsPerUpdate", float64(commitedPoints)/float64(updateOperations))
+		send("pointsPerUpdate", float64(committedPoints)/float64(updateOperations))
 	} else {
-		p.Stat("pointsPerUpdate", 0.0)
+		send("pointsPerUpdate", 0.0)
 	}
 
-	p.Stat("created", float64(created))
+	send("created", float64(created))
+	send("throttledCreates", float64(throttledCreates))
+	send("maxCreatesPerSecond", float64(p.maxCreatesPerSecond))
 
-}
+	send("maxUpdatesPerSecond", float64(p.maxUpdatesPerSecond))
+	send("workers", float64(p.workersCount))
 
-// stat timer
-func (p *Whisper) statWorker() {
-	ticker := app.Clock.Ticker(time.Minute)
-	defer ticker.Stop()
+	// helper.SendAndSubstractUint64("blockThrottleNs", &p.blockThrottleNs, send)
+	// helper.SendAndSubstractUint64("blockQueueGetNs", &p.blockQueueGetNs, send)
+	// helper.SendAndSubstractUint64("blockAvoidConcurrentNs", &p.blockAvoidConcurrentNs, send)
+	// helper.SendAndSubstractUint64("blockUpdateManyNs", &p.blockUpdateManyNs, send)
 
-	for {
-		select {
-		case <-p.exit:
-			break
-		case <-ticker.C:
-			go p.doCheckpoint()
-		}
-	}
 }
 
 // Start worker
-func (p *Whisper) Start() {
-	go p.statWorker()
+func (p *Whisper) Start() error {
+	return p.StartFunc(func() error {
 
-	inChan := p.in
-	if p.maxUpdatesPerSecond > 0 {
-		inChan = points.ThrottleChan(inChan, p.maxUpdatesPerSecond)
-	}
-
-	if p.workersCount <= 1 { // solo worker
-		go p.worker(inChan)
-	} else {
-		var channels [](chan *points.Points)
-
-		for i := 0; i < p.workersCount; i++ {
-			ch := make(chan *points.Points, 32)
-			channels = append(channels, ch)
-			go p.worker(ch)
+		p.throttleTicker = NewThrottleTicker(p.maxUpdatesPerSecond)
+		if p.hardMaxCreatesPerSecond {
+			p.maxCreatesTicker = NewHardThrottleTicker(p.maxCreatesPerSecond)
+		} else {
+			p.maxCreatesTicker = NewThrottleTicker(p.maxCreatesPerSecond)
 		}
 
-		go p.shuffler(inChan, channels)
-	}
+		for i := 0; i < p.workersCount; i++ {
+			p.Go(p.worker)
+		}
+
+		return nil
+	})
 }
 
-// Stop worker
 func (p *Whisper) Stop() {
-	close(p.exit)
+	p.StopFunc(func() {
+		p.throttleTicker.Stop()
+		p.maxCreatesTicker.Stop()
+	})
 }
